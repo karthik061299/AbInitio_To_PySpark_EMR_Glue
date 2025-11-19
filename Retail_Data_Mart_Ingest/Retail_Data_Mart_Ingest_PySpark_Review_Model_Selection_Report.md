@@ -435,6 +435,6 @@ RESULT: Model B (Claude) - Zero deployment blockers vs One deployment blocker
 **Action Required:** Deploy Model B (Claude) to production
 **Model A Disposition:** Archive - Do not deploy without refactoring
 
-====================================================
+-----------------------------------------
 END OF MODEL SELECTION REPORT
-====================================================
+-----------------------------------------
