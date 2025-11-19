@@ -1,12 +1,8 @@
-# ====================================================
-# Author:        AAVA
-# Date:          <leave it blank>
-# Description:   Retail Data Mart Ingest Pipeline - PySpark EMR Glue Validation Report
-# ====================================================
-
-📝 Validation Report
-
-## Component-by-Component Analysis
+-----------------------------------------
+Author:        AAVA  
+Date:         
+Description:   Retail Data Mart Ingest Pipeline - PySpark EMR Glue Validation Report
+-----------------------------------------
 
 ### 1. Flow & Order Validation
 **Ab Initio Flow (from .mp and Flow Chart):**
