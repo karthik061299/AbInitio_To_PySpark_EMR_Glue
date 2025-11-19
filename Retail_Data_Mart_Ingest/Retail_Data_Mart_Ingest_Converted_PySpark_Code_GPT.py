@@ -1,186 +1,256 @@
 # ====================================================
 # Author:        AAVA
 # Date:          
-# Description:   Retail Data Mart Ingest Pipeline - Ab Initio to PySpark EMR Glue Conversion
+# Description:   Retail Data Mart Ingest Pipeline - Converts Ab Initio ETL logic to PySpark EMR Glue
 # ====================================================
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sum as spark_sum, count, lit, floor, expr
+from pyspark.sql.functions import col, lit, when, isnan, isnull, trim, length
+from pyspark.sql.types import DecimalType
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
+from awsglue.dynamicframe import DynamicFrame
 import sys
 
-# Import schema definitions
-from Retail_Converted_DML import raw_input_schema, product_dimension_schema, enriched_schema, summary_schema
-# Import transformation functions
-from Retail_Converted_XFR import transform_cleanse_transform, transform_pricing_logic, transform_rollup_logic
+# Import transformation functions from converted XFR module
+from Retail_Converted_XFR import (
+    transform_cleanse_transform,
+    transform_pricing_logic,
+    transform_rollup_logic
+)
 
+# Import schema definitions from converted DML module
+from Retail_Converted_DML import (
+    raw_input_schema,
+    product_dimension_schema,
+    enriched_schema,
+    summary_schema
+)
 
-def main():
-    # Initialize Spark and Glue contexts
-    args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-    spark = SparkSession.builder.appName("Retail_Data_Mart_Ingest").getOrCreate()
-    glueContext = GlueContext(spark)
-    job = Job(glueContext)
-    job.init(args['JOB_NAME'], args)
+# Initialize Spark Session and Glue Context
+spark = SparkSession.builder \
+    .appName("Retail_Data_Mart_Ingest") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .getOrCreate()
 
-    # Configuration parameters
-    aws_bucket_url = "s3://shopsmart-retail-data/daily_batch/"
-    project_dir = "/retail_project"
-    error_log_path = f"{project_dir}/log/rejects_Retail_Data_Mart_Ingest.log"
-    product_miss_path = f"{project_dir}/data/out/product_misses.dat"
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
 
-    try:
-        # ====================================================
-        # COMPONENT 1: READ AWS S3 (Raw Transactions)
-        # ====================================================
-        print("Step 1: Reading raw transaction data from S3...")
-        raw_transactions_df = spark.read \
-            .option("delimiter", "|") \
-            .option("header", "false") \
-            .schema(raw_input_schema) \
-            .csv(f"{aws_bucket_url}/transactions_raw.dat")
+# Get job parameters
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'AWS_BUCKET_URL',
+    'PROJECT_DIR',
+    'ERROR_LOG_PATH',
+    'PRODUCT_MISS_PATH'
+])
 
-        print(f"Raw transactions count: {raw_transactions_df.count()}")
+job.init(args['JOB_NAME'], args)
 
-        # ====================================================
-        # COMPONENT 2: READ PRODUCT DIMENSION
-        # ====================================================
-        print("Step 2: Reading product dimension data...")
-        product_dim_df = spark.read \
-            .option("delimiter", "|") \
-            .option("header", "false") \
-            .schema(product_dimension_schema) \
-            .csv(f"{project_dir}/data/dim/product_dim.dat")
+# Configuration parameters (equivalent to Ab Initio parameters)
+AWS_BUCKET_URL = args.get('AWS_BUCKET_URL', 's3://shopsmart-retail-data/daily_batch/')
+PROJECT_DIR = args.get('PROJECT_DIR', 's3://shopsmart-retail-data/retail_project')
+ERROR_LOG_PATH = args.get('ERROR_LOG_PATH', f'{PROJECT_DIR}/log/rejects_Retail_Data_Mart_Ingest.log')
+PRODUCT_MISS_PATH = args.get('PRODUCT_MISS_PATH', f'{PROJECT_DIR}/data/out/product_misses.dat')
 
-        print(f"Product dimension count: {product_dim_df.count()}")
+print("Starting Retail Data Mart Ingest Pipeline...")
 
-        # ====================================================
-        # COMPONENT 3: CLEANSE DATA (Reformat with validation)
-        # ====================================================
-        print("Step 3: Cleansing and validating transaction data...")
-        cleansed_df = transform_cleanse_transform(raw_transactions_df)
+# =============================================================================
+# COMPONENT 1: INPUT FILE (Raw Transactions from AWS S3)
+# =============================================================================
+print("Step 1: Reading raw transaction data from S3...")
+raw_transactions_path = f"{AWS_BUCKET_URL}/transactions_raw.dat"
 
-        # Filter valid records (non-null txn_id and txn_date)
-        valid_records = cleansed_df.filter(
-            col("txn_id").isNotNull() & 
-            col("txn_date").isNotNull() & 
-            col("total_amount").isNotNull() &
-            (col("total_amount") > 0)
-        )
+# Read raw transaction data with schema
+raw_transactions_df = spark.read \
+    .option("delimiter", "|") \
+    .option("header", "false") \
+    .schema(raw_input_schema) \
+    .csv(raw_transactions_path)
 
-        # Filter invalid records for rejection
-        invalid_records = cleansed_df.filter(
-            col("txn_id").isNull() | 
-            col("txn_date").isNull() | 
-            col("total_amount").isNull() |
-            (col("total_amount") <= 0)
-        ).withColumn("error_message", lit("Invalid transaction data"))
+print(f"Raw transactions loaded: {raw_transactions_df.count()} records")
 
-        print(f"Valid records count: {valid_records.count()}")
-        print(f"Invalid records count: {invalid_records.count()}")
+# =============================================================================
+# COMPONENT 2: INPUT FILE (Product Dimension)
+# =============================================================================
+print("Step 2: Reading product dimension data...")
+product_dim_path = f"{PROJECT_DIR}/data/dim/product_dim.dat"
 
-        # ====================================================
-        # COMPONENT 4: DEDUP SORT (Remove Duplicate Transactions)
-        # ====================================================
-        print("Step 4: Removing duplicate transactions...")
-        deduped_df = valid_records.dropDuplicates(["txn_id"])
-        print(f"Deduplicated records count: {deduped_df.count()}")
+# Read product dimension data with schema
+product_dim_df = spark.read \
+    .option("delimiter", "|") \
+    .option("header", "false") \
+    .schema(product_dimension_schema) \
+    .csv(product_dim_path)
 
-        # ====================================================
-        # COMPONENT 5: ENRICHMENT JOIN (Inner join with Product Dimension)
-        # ====================================================
-        print("Step 5: Enriching transactions with product information...")
-        enriched_df = deduped_df.alias("txn").join(
-            product_dim_df.alias("prod"),
-            col("txn.product_sku") == col("prod.product_sku"),
-            "inner"
-        ).select(
-            col("txn.txn_id"),
-            col("txn.store_id"),
-            col("txn.txn_date"),
-            col("txn.product_sku"),
-            col("prod.category"),
-            col("txn.total_amount"),
-            col("prod.standard_cost"),
-            col("txn.tax_amount"),
-            col("txn.final_bill"),
-            col("txn.loyalty_points")
-        )
+print(f"Product dimension loaded: {product_dim_df.count()} records")
 
-        # Identify unmatched records (product lookup misses)
-        unmatched_records = deduped_df.alias("txn").join(
-            product_dim_df.alias("prod"),
-            col("txn.product_sku") == col("prod.product_sku"),
-            "left_anti"
-        )
+# =============================================================================
+# COMPONENT 3: REFORMAT (Cleanse & Validate)
+# =============================================================================
+print("Step 3: Cleansing and validating raw data...")
 
-        print(f"Enriched records count: {enriched_df.count()}")
-        print(f"Unmatched records count: {unmatched_records.count()}")
+# Apply cleanse transformation using XFR function
+cleansed_df = transform_cleanse_transform(raw_transactions_df)
 
-        # ====================================================
-        # COMPONENT 6: APPLY PRICING (Reformat with pricing rules)
-        # ====================================================
-        print("Step 6: Applying pricing rules...")
-        priced_df = transform_pricing_logic(enriched_df)
-        print(f"Priced records count: {priced_df.count()}")
+# Validation logic - identify reject records
+reject_condition = (
+    isnull(col("txn_id")) |
+    isnull(col("store_id")) |
+    isnull(col("product_sku")) |
+    (length(trim(col("txn_id"))) == 0) |
+    (length(trim(col("store_id"))) == 0) |
+    (length(trim(col("product_sku"))) == 0) |
+    (col("total_amount") <= 0)
+)
 
-        # ====================================================
-        # COMPONENT 7: SORT FOR ROLLUP (Prepare for aggregation)
-        # ====================================================
-        print("Step 7: Sorting data for rollup...")
-        sorted_df = priced_df.orderBy("store_id", "txn_date")
+# Split into clean and reject records
+clean_data_df = cleansed_df.filter(~reject_condition)
+reject_data_df = raw_transactions_df.filter(reject_condition) \
+    .withColumn("error_message", lit("Invalid or missing required fields"))
 
-        # ====================================================
-        # COMPONENT 8: STORE AGGREGATION (Rollup by store and date)
-        # ====================================================
-        print("Step 8: Performing store aggregation...")
-        aggregated_df = transform_rollup_logic(sorted_df)
-        print(f"Aggregated records count: {aggregated_df.count()}")
+print(f"Clean records: {clean_data_df.count()}")
+print(f"Reject records: {reject_data_df.count()}")
 
-        # ====================================================
-        # COMPONENT 9: WRITE SUMMARY (Final output)
-        # ====================================================
-        print("Step 9: Writing final summary report...")
-        aggregated_df.coalesce(1).write \
-            .mode("overwrite") \
-            .option("delimiter", "|") \
-            .option("header", "false") \
-            .csv(f"{project_dir}/data/out/daily_summary.dat")
+# =============================================================================
+# COMPONENT 4: DEDUP SORT (Remove Duplicate Transactions)
+# =============================================================================
+print("Step 4: Removing duplicate transactions...")
 
-        # ====================================================
-        # COMPONENT 10: WRITE CLEANSE REJECTS (Error handling)
-        # ====================================================
-        print("Step 10: Writing cleanse rejects...")
-        if invalid_records.count() > 0:
-            invalid_records.coalesce(1).write \
-                .mode("overwrite") \
-                .option("delimiter", "|") \
-                .option("header", "false") \
-                .csv(error_log_path)
+# Remove duplicates based on txn_id (keeping first occurrence)
+deduped_df = clean_data_df.dropDuplicates(["txn_id"])
 
-        # ====================================================
-        # COMPONENT 11: WRITE PRODUCT MISSES (Error handling)
-        # ====================================================
-        print("Step 11: Writing product lookup misses...")
-        if unmatched_records.count() > 0:
-            unmatched_records.coalesce(1).write \
-                .mode("overwrite") \
-                .option("delimiter", "|") \
-                .option("header", "false") \
-                .csv(product_miss_path)
+print(f"Records after deduplication: {deduped_df.count()}")
 
-        print("Pipeline completed successfully!")
-        print("\n=== SAMPLE FINAL RESULTS ===")
-        aggregated_df.show(10, truncate=False)
+# =============================================================================
+# COMPONENT 5: JOIN (Enrich with Product Info)
+# =============================================================================
+print("Step 5: Enriching data with product information...")
 
-    except Exception as e:
-        print(f"Error in pipeline execution: {str(e)}")
-        raise e
-    finally:
-        job.commit()
-        spark.stop()
+# Inner join with product dimension on product_sku
+enriched_df = deduped_df.alias("txn").join(
+    product_dim_df.alias("prod"),
+    col("txn.product_sku") == col("prod.product_sku"),
+    "inner"
+).select(
+    col("txn.txn_id"),
+    col("txn.store_id"),
+    col("txn.txn_date"),
+    col("txn.product_sku"),
+    col("prod.category"),
+    col("txn.total_amount"),
+    col("prod.standard_cost"),
+    col("txn.tax_amount"),
+    col("txn.final_bill"),
+    col("txn.loyalty_points")
+)
 
-if __name__ == "__main__":
-    main()
+# Identify records that didn't match (product lookup misses)
+product_misses_df = deduped_df.alias("txn").join(
+    product_dim_df.alias("prod"),
+    col("txn.product_sku") == col("prod.product_sku"),
+    "left_anti"
+)
+
+print(f"Enriched records: {enriched_df.count()}")
+print(f"Product lookup misses: {product_misses_df.count()}")
+
+# =============================================================================
+# COMPONENT 6: REFORMAT (Apply Pricing Rules)
+# =============================================================================
+print("Step 6: Applying pricing rules...")
+
+# Apply pricing transformation using XFR function
+priced_df = transform_pricing_logic(enriched_df)
+
+print(f"Records after pricing: {priced_df.count()}")
+
+# =============================================================================
+# COMPONENT 7: SORT (Prepare for Rollup)
+# =============================================================================
+print("Step 7: Sorting data for rollup aggregation...")
+
+# Sort by store_id and txn_date for efficient rollup processing
+sorted_df = priced_df.orderBy("store_id", "txn_date")
+
+print("Data sorted for rollup processing")
+
+# =============================================================================
+# COMPONENT 8: ROLLUP (Store Aggregation)
+# =============================================================================
+print("Step 8: Performing store-level aggregation...")
+
+# Apply rollup transformation using XFR function
+summary_df = transform_rollup_logic(sorted_df)
+
+print(f"Summary records generated: {summary_df.count()}")
+
+# =============================================================================
+# COMPONENT 9: OUTPUT FILE (Final Summary)
+# =============================================================================
+print("Step 9: Writing final summary report...")
+
+summary_output_path = f"{PROJECT_DIR}/data/out/daily_summary.dat"
+
+# Write summary data to S3
+summary_df.coalesce(1) \
+    .write \
+    .mode("overwrite") \
+    .option("delimiter", "|") \
+    .option("header", "false") \
+    .csv(summary_output_path)
+
+print(f"Summary report written to: {summary_output_path}")
+
+# =============================================================================
+# COMPONENT 10: OUTPUT FILE (Cleanse Rejects)
+# =============================================================================
+print("Step 10: Writing cleanse reject records...")
+
+if reject_data_df.count() > 0:
+    reject_data_df.coalesce(1) \
+        .write \
+        .mode("overwrite") \
+        .option("delimiter", "|") \
+        .option("header", "false") \
+        .csv(ERROR_LOG_PATH)
+    print(f"Reject records written to: {ERROR_LOG_PATH}")
+else:
+    print("No reject records to write")
+
+# =============================================================================
+# COMPONENT 11: OUTPUT FILE (Product Lookup Misses)
+# =============================================================================
+print("Step 11: Writing product lookup misses...")
+
+if product_misses_df.count() > 0:
+    product_misses_df.coalesce(1) \
+        .write \
+        .mode("overwrite") \
+        .option("delimiter", "|") \
+        .option("header", "false") \
+        .csv(PRODUCT_MISS_PATH)
+    print(f"Product misses written to: {PRODUCT_MISS_PATH}")
+else:
+    print("No product lookup misses to write")
+
+# =============================================================================
+# PIPELINE COMPLETION AND CLEANUP
+# =============================================================================
+print("\n=== PIPELINE EXECUTION SUMMARY ===")
+print(f"Raw transactions processed: {raw_transactions_df.count()}")
+print(f"Clean records after validation: {clean_data_df.count()}")
+print(f"Records after deduplication: {deduped_df.count()}")
+print(f"Records enriched with product data: {enriched_df.count()}")
+print(f"Final summary records: {summary_df.count()}")
+print(f"Reject records: {reject_data_df.count()}")
+print(f"Product lookup misses: {product_misses_df.count()}")
+print("\nRetail Data Mart Ingest Pipeline completed successfully!")
+
+# Commit the Glue job
+job.commit()
+
+# Stop Spark session
+spark.stop()
